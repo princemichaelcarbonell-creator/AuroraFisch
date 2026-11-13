@@ -33,6 +33,7 @@ local Config = {
     ReelMode   = "Perfect",
     CastDelay  = 1.2,
     ShakeDelay = 0.15,
+    ReelDelay  = 1.5,
     AutoSell   = false,
     SellInterval = 120,
     AntiAFK    = true,
@@ -146,6 +147,19 @@ local function fireRemote(action, ...)
     return false
 end
 
+-- exact single send: NO shape-guessing, NO fallback.
+-- Fisch's server kicks for malformed payloads ("invalid content behavior"),
+-- so fishing actions only ever send the exact verified signature.
+local function fireRemoteExact(action, ...)
+    local r = resolveRemote(action)
+    if not r then return false end
+    local args = { ... }
+    if r:IsA("RemoteFunction") then
+        return pcall(function() r:InvokeServer(unpack(args)) end)
+    end
+    return pcall(function() r:FireServer(unpack(args)) end)
+end
+
 --................................................................
 -- FISHING CORE
 --................................................................
@@ -155,28 +169,40 @@ local function alive()
 end
 
 local function getBobber()
+    -- the live bobber is a child of the equipped rod Tool, named exactly "bobber"
+    -- (the rod's cosmetic mesh is "Bodybobber" — never match that)
     local c = player.Character
     if not c then return nil end
-    for _, d in ipairs(c:GetDescendants()) do
-        if (d:IsA("BasePart") or d:IsA("Model"))
-            and string.find(string.lower(d.Name), "bobber") then
-            return d
-        end
+    local tool = c:FindFirstChildOfClass("Tool")
+    if tool then
+        local b = tool:FindFirstChild("bobber")
+        if b then return b end
+    end
+    for _, d in ipairs(c:GetChildren()) do
+        if d.Name == "bobber" then return d end
     end
     return nil
 end
 
 local function reelGuiActive()
+    -- verified: reel ScreenGui is cloned into PlayerGui as "reel",
+    -- and Character gets the ReelActive attribute while the minigame runs
+    local c = player.Character
+    if c and c:GetAttribute("ReelActive") ~= nil then return true end
     local pg = player:FindFirstChild("PlayerGui")
-    if not pg then return false end
-    for _, g in ipairs(pg:GetChildren()) do
-        if g:IsA("ScreenGui") and g.Enabled
-            and (string.find(string.lower(g.Name), "reel")
-                or string.find(string.lower(g.Name), "fishing")) then
-            return true
-        end
+    if pg then
+        local g = pg:FindFirstChild("reel")
+        if g and g:IsA("ScreenGui") and g.Enabled then return true end
     end
     return false
+end
+
+local function shakeUiActive()
+    -- verified: LureShakeController parents a ScreenGui named "shakeui" during the bite
+    local pg = player:FindFirstChild("PlayerGui")
+    if not pg then return false end
+    local g = pg:FindFirstChild("shakeui")
+    return g ~= nil and g:IsA("ScreenGui") and g.Enabled
 end
 
 local function equipRod()
@@ -241,40 +267,55 @@ task.spawn(function()
             if not Config.AutoFish or not alive() then fishStatus = "idle" return end
             if Config.AutoEquip then equipRod() end
             if reelGuiActive() then fishStatus = "reeling" return end
+            if shakeUiActive() then fishStatus = "bite" return end
             if getBobber() then fishStatus = "waiting / shake" return end
             fishStatus = "casting"
-            if Config.AutoCast then fireRemote("cast", 100) end
+            -- verified: RF/FishingRod/Cast:InvokeServer(chargePercent, silent)
+            if Config.AutoCast then fireRemoteExact("cast", 100, false) end
             task.wait(math.max(Config.CastDelay, 0.3))
         end)
         task.wait(0.15)
     end
 end)
 
--- shake loop
+-- shake loop: fires only while the shake UI is up (server clamps ~0.25s between shakes)
 task.spawn(function()
     while running do
-        if Config.AutoFish and Config.AutoShake and alive()
-            and getBobber() and not reelGuiActive() then
+        if Config.AutoFish and Config.AutoShake and alive() and shakeUiActive() then
             fishStatus = "shake"
-            fireRemote("shake")        end
-        task.wait(math.max(Config.ShakeDelay, 0.05))
+            -- verified: RE/LureShake/Shake:FireServer() — no args
+            fireRemoteExact("shake")
+        end
+        task.wait(math.max(Config.ShakeDelay, 0.1))
     end
 end)
 
--- reel loop
+-- reel loop: fires Reel/Finish exactly ONCE per reel session, with the exact
+-- payload the game's own EndMinigame sends: { e = progress, p = perfect, l = {}, d = data }
+local reelFired = false
 task.spawn(function()
     while running do
-        if Config.AutoFish and Config.AutoReel and reelGuiActive() then
-            local pct
-            if Config.ReelMode == "Safe" then
-                pct = math.floor(55 + 40 * math.abs(math.sin(os.clock() * 2.5)))
-            else
-                pct = 100
+        local c = player.Character
+        local reeling = c ~= nil and c:GetAttribute("ReelActive") ~= nil
+        if not reeling and player:FindFirstChild("PlayerGui") then
+            local g = player.PlayerGui:FindFirstChild("reel")
+            reeling = g ~= nil and g:IsA("ScreenGui") and g.Enabled
+        end
+        if Config.AutoFish and Config.AutoReel and reeling then
+            fishStatus = "reeling"
+            if not reelFired then
+                reelFired = true
+                task.wait(math.max(Config.ReelDelay, 0.5))
+                fireRemoteExact("reelFinish", { e = 100, p = true, l = {}, d = {} })
             end
-            fireRemote("reelFinish", pct)
-            RunService.Heartbeat:Wait()
         else
+            reelFired = false
             task.wait(0.1)
+        end
+        if reeling and not reelFired then
+            task.wait(0.05)
+        else
+            task.wait(0.15)
         end
     end
 end)
@@ -1135,6 +1176,7 @@ dropdown(reelSec, "Reel Mode", { "Perfect", "Safe" }, Config.ReelMode, function(
 end)
 slider(reelSec, "Cast Delay (s)", 0.3, 3, Config.CastDelay, "CastDelay")
 slider(reelSec, "Shake Delay (s)", 0.05, 0.5, Config.ShakeDelay, "ShakeDelay")
+slider(reelSec, "Reel Delay (s)", 0.5, 5, Config.ReelDelay, "ReelDelay")
 
 local statSec = section(pFishing, "status")
 local statusLabel = create("TextLabel", {
