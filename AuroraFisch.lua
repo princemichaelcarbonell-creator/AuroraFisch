@@ -79,34 +79,65 @@ local function saveConfig()
 end
 
 --................................................................
--- REMOTES (Packages.Net wrapper + fallback scan)
+-- REMOTES (packages.Net — names verified live on Fisch place v645)
 --................................................................
-local netOK, Net = pcall(function()
-    local pkg = ReplicatedStorage:WaitForChild("Packages", 10)
-    return pkg and pkg:WaitForChild("Net", 10) and require(pkg.Net)
-end)
+-- NOTE: never require(packages.Net) — it yields in this env and hangs load.
+-- The Net module's children are instances literally named "RF/FishingRod/Cast"
+-- etc., so direct lookup by name is exact and non-blocking.
+local netModule = nil
+do
+    local pkg = ReplicatedStorage:FindFirstChild("packages")
+        or ReplicatedStorage:FindFirstChild("Packages")
+    if pkg then
+        netModule = pkg:FindFirstChild("Net") or pkg:FindFirstChild("_Net")
+    end
+end
 
-local remoteCache = {}
-local function getRemote(name)
-    if remoteCache[name] ~= nil then return remoteCache[name] or nil end
+-- Each action tries candidates in order; old pre-645 names kept as fallback.
+local REMOTE_ALIASES = {
+    cast       = { "RF/FishingRod/Cast", "FishingRod/Cast", "casting" },
+    shake      = { "RE/LureShake/Shake", "LureShake/Shake", "shake" },
+    reelStart  = { "RF/Reel/Start", "Reel/Start" },
+    reelFinish = { "RE/Reel/Finish", "Reel/Finish", "reeling" },
+    sell       = { "sellall", "SellAll", "sell" },
+}
+
+local resolved = {}
+local function resolveRemote(action)
+    if resolved[action] ~= nil then return resolved[action] or nil end
     local found
-    if netOK and Net then
-        local ok, res = pcall(function() return Net:RemoteEvent(name) end)
-        if ok then found = res end
+    if netModule then
+        for _, name in ipairs(REMOTE_ALIASES[action] or { action }) do
+            local child = netModule:FindFirstChild(name)
+            if child then found = child break end
+        end
+        if not found then
+            for _, c in ipairs(netModule:GetDescendants()) do
+                if c:IsA("RemoteEvent") or c:IsA("RemoteFunction") then
+                    for _, name in ipairs(REMOTE_ALIASES[action] or { action }) do
+                        if c.Name == name then found = c break end
+                    end
+                    if found then break end
+                end
+            end
+        end
     end
-    if not found then
-        local pkg = ReplicatedStorage:FindFirstChild("Packages")
-        local net = pkg and (pkg:FindFirstChild("Net") or pkg:FindFirstChild("_Net"))
-        found = net and net:FindFirstChild(name)
-    end
-    remoteCache[name] = found or false
+    resolved[action] = found or false
     return found
 end
 
-local function fireRemote(name, ...)
-    local r = getRemote(name)
+local function fireRemote(action, ...)
+    local r = resolveRemote(action)
     if not r then return false end
     local args = { ... }
+    if r:IsA("RemoteFunction") then
+        local ok = pcall(function() r:InvokeServer(unpack(args)) end)
+        if ok then return true end
+        if #args > 0 then
+            return pcall(function() r:InvokeServer() end)
+        end
+        return false
+    end
     local ok = pcall(function() r:FireServer(unpack(args)) end)
     if ok then return true end
     if #args > 0 then
@@ -126,15 +157,24 @@ end
 local function getBobber()
     local c = player.Character
     if not c then return nil end
-    return c:FindFirstChild("bobber") or c:FindFirstChild("Bobber")
+    for _, d in ipairs(c:GetDescendants()) do
+        if (d:IsA("BasePart") or d:IsA("Model"))
+            and string.find(string.lower(d.Name), "bobber") then
+            return d
+        end
+    end
+    return nil
 end
 
 local function reelGuiActive()
     local pg = player:FindFirstChild("PlayerGui")
     if not pg then return false end
-    for _, name in ipairs({ "reel", "Reel", "reelUI" }) do
-        local g = pg:FindFirstChild(name)
-        if g and g:IsA("ScreenGui") and g.Enabled then return true end
+    for _, g in ipairs(pg:GetChildren()) do
+        if g:IsA("ScreenGui") and g.Enabled
+            and (string.find(string.lower(g.Name), "reel")
+                or string.find(string.lower(g.Name), "fishing")) then
+            return true
+        end
     end
     return false
 end
@@ -158,27 +198,38 @@ local function equipRod()
 end
 
 local function autoSell()
-    for _, name in ipairs({ "sellall", "SellAll", "sell" }) do
+    for _, name in ipairs(REMOTE_ALIASES.sell) do
         if fireRemote(name) then
             return true
         end
     end
-    -- fallback: merchant prompts
+    -- fallback: merchant prompt near the player, spatial query only
+    -- (never workspace:GetDescendants() — Fisch's map wedges the VM)
     local did = false
-    for _, d in ipairs(workspace:GetDescendants()) do
-        if d:IsA("ProximityPrompt") and d.ActionText
-            and string.find(string.lower(d.ActionText), "sell") then
-            if type(fireproximityprompt) == "function" then
-                pcall(function() fireproximityprompt(d, 0) end)
-            else
+    local c = player.Character
+    local hrp = c and c:FindFirstChild("HumanoidRootPart")
+    if not hrp then return false end
+    local parts = workspace:GetPartBoundsInRadius(hrp.Position, 60)
+    for _, part in ipairs(parts) do
+        local node = part
+        for _ = 1, 3 do
+            if not node then break end
+            local prompt = node:FindFirstChildOfClass("ProximityPrompt")
+            if prompt and prompt.ActionText
+                and string.find(string.lower(prompt.ActionText), "sell") then
                 pcall(function()
-                    d.HoldDuration = 0
-                    fireproximityprompt(d)
-                end)
+                    prompt.HoldDuration = 0
+                    if type(fireproximityprompt) == "function" then
+                        fireproximityprompt(prompt, 0)
+                    else
+                        fireproximityprompt(prompt)
+                    end
+                end)                did = true
+                break
             end
-            did = true
-            break
+            node = node.Parent
         end
+        if did then break end
     end
     return did
 end
@@ -192,7 +243,7 @@ task.spawn(function()
             if reelGuiActive() then fishStatus = "reeling" return end
             if getBobber() then fishStatus = "waiting / shake" return end
             fishStatus = "casting"
-            if Config.AutoCast then fireRemote("casting", 100, false) end
+            if Config.AutoCast then fireRemote("cast", 100) end
             task.wait(math.max(Config.CastDelay, 0.3))
         end)
         task.wait(0.15)
@@ -205,8 +256,7 @@ task.spawn(function()
         if Config.AutoFish and Config.AutoShake and alive()
             and getBobber() and not reelGuiActive() then
             fishStatus = "shake"
-            fireRemote("shake")
-        end
+            fireRemote("shake")        end
         task.wait(math.max(Config.ShakeDelay, 0.05))
     end
 end)
@@ -221,7 +271,7 @@ task.spawn(function()
             else
                 pct = 100
             end
-            fireRemote("reeling", pct)
+            fireRemote("reelFinish", pct)
             RunService.Heartbeat:Wait()
         else
             task.wait(0.1)
@@ -328,16 +378,24 @@ local ISLAND_NAMES = {
 
 local function scanIslands()
     local found = {}
-    local lowerWant = {}
-    for _, n in ipairs(ISLAND_NAMES) do lowerWant[string.lower(n)] = n end
-    for _, m in ipairs(workspace:GetDescendants()) do
-        if m:IsA("Model") then
-            local canon = lowerWant[string.lower(m.Name)]
-            if canon and not table.find(found, canon) then
-                table.insert(found, canon)
+    local want = {}
+    for _, n in ipairs(ISLAND_NAMES) do want[string.lower(n)] = n end
+    -- depth-limited walk only: a full workspace:GetDescendants() wedges the VM on Fisch's map
+    local function walk(container, depth)
+        if depth > 3 then return end
+        for _, c in ipairs(container:GetChildren()) do
+            if c:IsA("Model") then
+                local canon = want[string.lower(c.Name)]
+                if canon and not table.find(found, canon) then
+                    table.insert(found, canon)
+                end
+            end
+            if c:IsA("Folder") or c:IsA("Model") then
+                walk(c, depth + 1)
             end
         end
     end
+    walk(workspace, 0)
     table.sort(found)
     return found
 end
@@ -351,11 +409,25 @@ local function teleportTo(pos)
 end
 
 local function islandPosition(name)
-    for _, m in ipairs(workspace:GetDescendants()) do
-        if m:IsA("Model") and string.lower(m.Name) == string.lower(name) then
-            local pivot = m:GetPivot()
-            return pivot.Position + Vector3.new(0, 30, 0)
+    -- depth-limited find, same crash rule as scanIslands
+    local function find(container, depth)
+        if depth > 3 or not container then return nil end
+        for _, c in ipairs(container:GetChildren()) do
+            if c:IsA("Model") and string.lower(c.Name) == string.lower(name) then
+                return c
+            end
         end
+        for _, c in ipairs(container:GetChildren()) do
+            if c:IsA("Folder") or c:IsA("Model") then
+                local hit = find(c, depth + 1)
+                if hit then return hit end
+            end
+        end
+        return nil
+    end
+    local m = find(workspace, 0)
+    if m then
+        return m:GetPivot().Position + Vector3.new(0, 30, 0)
     end
     return nil
 end
